@@ -1,0 +1,151 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // ---------- সাধারণ হেল্পার ----------
+    // ===== Admin: আপনার Gmail ও Firebase User UID এখানে বসান (Authentication → Users ট্যাবে UID দেখা যায়) =====
+    // ইমেইল ও UID দুটোই মিললে তবেই admin। ইমেইল অবশ্যই ছোট হাতের অক্ষরে লিখুন।
+    // একাধিক admin হলে নিচের মতো আরেকটি লাইন যোগ করুন: || (request.auth.uid == 'UID2' && request.auth.token.email == 'mail2@gmail.com')
+    function isAdmin() {
+      return request.auth != null
+        && ((request.auth.uid == 'kLFjenATMOXQXqywd4prMOYuUwO2' && request.auth.token.email == 'contacts2forhad@gmail.com'));
+    }
+    function S() {
+      return exists(/databases/$(db)/documents/settings/store)
+        ? get(/databases/$(db)/documents/settings/store).data : {};
+    }
+    function pk() { return S().get('packageKg', 11); }
+    function str(v, max) { return v is string && v.size() > 0 && v.size() <= max; }
+    function phoneOk(v) { return v is string && v.matches('01[3-9][0-9]{8}'); }
+
+    // ---------- ডিসকাউন্ট: পণ্যের দাম থেকে কার্যকর দাম (শতাংশে নিচের পূর্ণসংখ্যায়; অর্ডারে এটিই মিলতে হবে) ----------
+    function discOk(d) {
+      let t = d.get('discountType', 'none');
+      let v = d.get('discountValue', 0);
+      return t in ['none', 'percent', 'fixed'] && v is int && v >= 0
+        && (t == 'none' ? v == 0 : t == 'percent' ? (v >= 1 && v <= 90) : (v >= 1 && v < d.pricePerKg));
+    }
+    function eff(p) {
+      return p.get('discountType', 'none') == 'percent'
+        ? ((p.pricePerKg * (100 - p.discountValue)) - ((p.pricePerKg * (100 - p.discountValue)) % 100)) / 100
+        : p.get('discountType', 'none') == 'fixed' ? p.pricePerKg - p.discountValue : p.pricePerKg;
+    }
+
+    // ---------- অর্ডারের আইটেম যাচাই (সর্বোচ্চ ৬ ধরনের আম) ----------
+    // দাম/নাম সবসময় products ডকুমেন্টের সাথে মেলানো হয়; productId কঠোরভাবে ক্রমবর্ধমান (ডুপ্লিকেট ঠেকাতে)
+    function P(d, i) { return get(/databases/$(db)/documents/products/$(d.items[i].productId)).data; }
+    function itemOk(d, i) {
+      return d.items.size() <= i || (
+        d.items[i] is map
+        && d.items[i].keys().hasOnly(['productId', 'nameBn', 'qtyKg', 'pricePerKg', 'lineTotal'])
+        && d.items[i].keys().hasAll(['productId', 'nameBn', 'qtyKg', 'pricePerKg', 'lineTotal'])
+        && d.items[i].productId is string && d.items[i].productId.matches('[A-Za-z0-9]{1,40}')
+        && (i == 0 || d.items[i].productId > d.items[i - 1].productId)
+        && d.items[i].qtyKg is int && d.items[i].qtyKg >= 1 && d.items[i].qtyKg <= 200
+        && d.items[i].qtyKg % pk() == 0
+        && P(d, i).active == true
+        && P(d, i).nameBn == d.items[i].nameBn
+        && eff(P(d, i)) == d.items[i].pricePerKg
+        && d.items[i].lineTotal == d.items[i].pricePerKg * d.items[i].qtyKg);
+    }
+    function lt(d, i) { return d.items.size() > i ? d.items[i].lineTotal : 0; }
+    function kg(d, i) { return d.items.size() > i ? d.items[i].qtyKg : 0; }
+
+    function orderKeys() {
+      return ['orderId', 'customerName', 'phone', 'district', 'upazila', 'address',
+        'items', 'subtotal', 'deliveryCharge', 'total', 'totalKg', 'paymentMethod', 'paymentStatus',
+        'orderStatus', 'transactionId', 'createdAt', 'updatedAt'];
+    }
+    function orderOk(id, d) {
+      return d.keys().hasOnly(orderKeys()) && d.keys().hasAll(orderKeys())
+        && id.matches('SA-[0-9A-F]{10}') && d.orderId == id
+        && S().get('ordersOpen', true) == true
+        // গ্রাহকের তথ্য
+        && str(d.customerName, 80) && phoneOk(d.phone)
+        && str(d.district, 40) && str(d.upazila, 40) && str(d.address, 300)
+        // আইটেম
+        && d.items is list && d.items.size() >= 1 && d.items.size() <= 6
+        && itemOk(d, 0) && itemOk(d, 1) && itemOk(d, 2) && itemOk(d, 3) && itemOk(d, 4) && itemOk(d, 5)
+        // হিসাব: সাবটোটাল, কেজি, ডেলিভারি, মোট — সব rules নিজে মিলিয়ে দেখে
+        && d.subtotal is int && d.subtotal == lt(d, 0) + lt(d, 1) + lt(d, 2) + lt(d, 3) + lt(d, 4) + lt(d, 5)
+        && d.totalKg is int && d.totalKg == kg(d, 0) + kg(d, 1) + kg(d, 2) + kg(d, 3) + kg(d, 4) + kg(d, 5)
+        && d.totalKg % pk() == 0 && d.totalKg >= S().get('minOrderKg', 0)
+        && d.deliveryCharge is int
+        && d.deliveryCharge * pk() == d.totalKg * S().get('deliveryChargePerPackage', 120)
+        && d.total is int && d.total == d.subtotal + d.deliveryCharge
+        // পেমেন্ট ও স্ট্যাটাস: গ্রাহক শুধু pending দিয়ে শুরু করতে পারে
+        && d.paymentMethod in ['cod', 'bkash', 'nagad']
+        && (d.paymentMethod == 'cod' ? d.transactionId == '' : str(d.transactionId, 40))
+        && d.paymentStatus == 'pending' && d.orderStatus == 'pending'
+        && d.createdAt == request.time && d.updatedAt == request.time;
+    }
+
+
+    // ---------- ট্র্যাকিং ডকুমেন্ট (গ্রাহকের পাবলিক অবস্থা-পেজ; ঠিকানা/ফোন নেই, শুধু ফোন-হ্যাশ) ----------
+    // শুধু অর্ডারের সাথে একই batch-এ তৈরি করা যায় (existsAfter); আইডি জানা থাকলে get করা যায়, list শুধু admin
+    function trackOk(id, d) {
+      return d.keys().hasOnly(['orderId', 'orderStatus', 'paymentStatus', 'total', 'itemsText', 'phoneHash', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['orderId', 'orderStatus', 'paymentStatus', 'total', 'itemsText', 'phoneHash', 'createdAt', 'updatedAt'])
+        && id.matches('SA-[0-9A-F]{10}') && d.orderId == id
+        && existsAfter(/databases/$(db)/documents/orders/$(id))
+        && d.total is int && d.total == getAfter(/databases/$(db)/documents/orders/$(id)).data.total
+        && d.orderStatus == 'pending' && d.paymentStatus == 'pending'
+        && str(d.itemsText, 700) && d.phoneHash is string && d.phoneHash.matches('[0-9a-f]{64}')
+        && d.createdAt == request.time && d.updatedAt == request.time;
+    }
+
+    // ---------- কালেকশন ----------
+    match /products/{id} {
+      allow read: if resource.data.active == true || isAdmin();
+      allow create, update: if isAdmin()
+        && request.resource.data.nameBn is string && request.resource.data.nameBn.size() > 0 && request.resource.data.nameBn.size() <= 80
+        && request.resource.data.pricePerKg is int && request.resource.data.pricePerKg >= 0
+        && discOk(request.resource.data)
+        && request.resource.data.active is bool;
+      allow delete: if isAdmin();
+    }
+    match /settings/store {
+      allow read: if true;
+      allow write: if isAdmin()
+        && request.resource.data.deliveryChargePerPackage is number && request.resource.data.deliveryChargePerPackage >= 0
+        && request.resource.data.packageKg is int && request.resource.data.packageKg > 0;
+    }
+    match /orders/{id} {
+      allow read: if isAdmin();
+      allow create: if orderOk(id, request.resource.data); // যে কেউ (লগইন ছাড়া) — কিন্তু শুধু নিখুঁত, যাচাইকৃত অর্ডার
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['orderStatus', 'paymentStatus', 'updatedAt', 'cancelReason', 'adminNote', 'courierInfo'])
+        && request.resource.data.get('adminNote', '') is string && request.resource.data.get('adminNote', '').size() <= 300
+        && request.resource.data.get('courierInfo', '') is string && request.resource.data.get('courierInfo', '').size() <= 120
+        && request.resource.data.orderStatus in ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled']
+        && request.resource.data.paymentStatus in ['pending', 'paid', 'failed', 'refunded']
+        && !(resource.data.orderStatus == 'cancelled' && request.resource.data.orderStatus != 'cancelled');
+      allow delete: if isAdmin(); // Admin প্যানেল থেকে অর্ডার মোছা (নিশ্চিতকরণ পপআপসহ)
+    }
+    match /tracking/{id} {
+      allow get: if true;
+      allow list: if isAdmin();
+      allow create: if isAdmin() || trackOk(id, request.resource.data);
+      allow update, delete: if isAdmin();
+    }
+    match /reviews/{id} {
+      allow read: if resource.data.status == 'approved' || isAdmin(); // গ্রাহক শুধু অনুমোদিত রিভিউ দেখে
+      allow create: if request.resource.data.keys().hasOnly(['name', 'rating', 'text', 'status', 'createdAt'])
+        && request.resource.data.keys().hasAll(['name', 'rating', 'text', 'status', 'createdAt'])
+        && str(request.resource.data.name, 60) && request.resource.data.rating is int
+        && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+        && str(request.resource.data.text, 400) && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time;
+      allow update: if isAdmin() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+        && request.resource.data.status in ['pending', 'approved', 'rejected'];
+      allow delete: if isAdmin();
+    }
+    match /orderStatusLogs/{id} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && request.resource.data.actor == request.auth.uid;
+      allow update, delete: if false;
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
